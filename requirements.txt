@@ -1,0 +1,14 @@
+# GCS ROV - Dashboard Terintegrasi
+#
+# Python 3.10 atau lebih baru.
+# tkinter sudah termasuk pada instalasi resmi Python untuk Windows dan macOS.
+# Di Linux, pasang paket sistemnya lebih dulu:
+#   sudo apt install python3-tk
+#
+# Proyek ini TIDAK memerlukan paket pihak ketiga. Seluruh modul yang dipakai
+# berasal dari pustaka standar Python:
+#   tkinter, tkinter.ttk, tkinter.messagebox, tkinter.filedialog,
+#   json, random, datetime
+#
+# Opsional (belum dipakai di kode, hanya jika nanti menambah grafik):
+# matplotlib>=3.7

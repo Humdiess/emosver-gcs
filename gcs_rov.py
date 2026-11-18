@@ -1,31 +1,37 @@
 """GCS ROV: dashboard terintegrasi monitoring sensor dan kontrol thruster.
 
 MODE
-    SIMULASI : sensor dibangkitkan otomatis dengan random walk setiap 500 ms.
-               Penguji dapat memicu skenario tidak ideal lewat tombol uji.
+    SIMULASI : sensor dibangkitkan otomatis setiap 500 ms dan thruster yang
+               aktif benar-benar menggerakkan ROV (kedalaman, heading,
+               posisi). Penguji memilih skenario uji di header lalu menekan
+               TERAPKAN.
     REAL     : telemetri dibaca dari file JSON hasil logger ROV, dan perintah
                ditulis ke perintah_rov.txt. Tanpa pyserial/socket, jembatan
                berbasis file dipakai sebagai pengganti port serial.
 
 ALUR KODE (untuk pengembangan lanjut)
     1. Konstanta       : warna, font, batas keselamatan, daftar sensor,
-                         peta arah per thruster, dan parameter auto ascent.
+                         peta arah per thruster, dan parameter gerak.
     2. categorize()    : mengubah nilai sensor menjadi NORMAL/WARNING/BAHAYA.
     3. App.__init__    : menyiapkan state awal lalu memanggil _build_*().
-    4. Pembangunan UI  : _build_header, _build_main (sensor + kontrol),
+    4. Pembangunan UI  : _build_header (mode, skenario, LINK, jam),
+                         _build_main (kiri monitoring, kanan kontrol),
                          _build_log, _build_status_bar.
+                         Kill switch berada di bawah panel kontrol.
     5. Loop utama      : _tick() dipanggil tiap TICK_MS lewat after():
-         a. sumber data  : _simulate_step() / _step_auto_ascent() / _read_real()
-         b. LINK         : _update_link() memakai selisih waktu datetime
-         c. keselamatan  : _update_safety() mengunci kontrol saat BAHAYA dan
+         a. sumber data  : _simulate_step() / _step_auto_ascent() /
+                           _read_real()
+         b. gerak        : _step_motion() memakai motor[] yang aktif
+         c. LINK         : _update_link() memakai selisih waktu datetime
+         d. keselamatan  : _update_safety() mengunci kontrol saat BAHAYA dan
                            memicu auto ascent bila baterai < 15 % di kedalaman
-         d. kategori     : _log_level_changes() mencatat perubahan status
-         e. tampilan     : _refresh_display()
+         e. kategori     : _log_level_changes() mencatat perubahan status
+         f. tampilan     : _refresh_display()
        Tidak ada sleep() maupun while True.
     6. Skenario uji    : dropdown + tombol TERAPKAN di header memanggil
-                         scenario_normal / scenario_low_battery /
-                         scenario_hot, dan tombol link memutus data.
-                         Hanya aktif di mode SIMULASI.
+                         scenario_normal / scenario_hot /
+                         scenario_battery_surface / scenario_battery_submerged.
+                         Tombol link memutus data. Hanya aktif di SIMULASI.
     7. Pemilihan       : _select_thruster() mengganti opsi arah sesuai
                          thruster (Vertikal memakai Naik/Turun).
     8. Perintah        : send_command() -> _check_interlock() -> motor[]
@@ -35,13 +41,31 @@ ALUR KODE (untuk pengembangan lanjut)
    10. Penutupan       : jendela tidak bisa ditutup dengan X; hanya lewat
                          tombol TUTUP APLIKASI (close_app()).
 
+MODEL GERAK SIMULASI
+    - Thruster Vertikal (Naik/Turun) mengubah kedalaman.
+    - Thruster horizontal Maju/Mundur menggeser posisi X/Y sepanjang heading.
+    - Selisih dorongan thruster kiri dan kanan memutar heading (differential).
+    - Pitch mengikuti gerak vertikal, roll mengikuti laju putar.
+
 SKENARIO OTOMATIS SAAT BAHAYA
-    - Suhu > 45 °C atau baterai < 15 % -> kontrol dikunci, tombol BUKA KUNCI
-      aktif untuk override manual.
+    - Suhu > 45 °C atau baterai < 15 % -> kontrol dikunci, motor dihentikan,
+      tombol BUKA KUNCI aktif untuk override manual.
     - Baterai < 15 % saat ROV masih di kedalaman -> auto ascent menghitung
       sisa baterai dan jarak ke permukaan, lalu menaikkan ROV otomatis
       sambil mengunci seluruh kontrol.
     - Saat kondisi kembali normal, kunci dibuka otomatis.
+
+RESPONSIF
+    Semua kontainer memakai grid dengan weight dan sticky="nsew". Panel
+    kontrol berpindah dari tiga kolom menjadi dua baris saat lebar panel
+    kurang dari 620 px (_reflow_control). Window minimum 1024x680.
+
+TAMPILAN OUTDOOR
+    Tema terang kontras tinggi: latar abu terang, kartu putih, teks hampir
+    hitam (#0d0d0d), aksen kuning terang (#ffd400) untuk aksi utama, dan
+    hijau tua untuk status normal. Teks berwarna pada latar putih memakai
+    varian pekat (hijau #0b6b2c, amber #7a4a00, merah #b3261e) agar tetap
+    terbaca saat layar terkena sinar matahari.
 
 CARA MENAMBAH SENSOR
     Tambahkan entri di SENSOR_SPECS, aturan kategori di categorize(), dan
@@ -49,20 +73,17 @@ CARA MENAMBAH SENSOR
 
 CARA MENAMBAH THRUSTER
     Tambahkan nama di THRUSTERS dan pasangan arahnya di THRUSTER_DIRECTIONS.
-    Tombol pilih dan kartu status akan mengikuti otomatis.
-
-TAMPILAN OUTDOOR
-    Palet kontras tinggi (teks hampir hitam, kartu putih, batas tebal) dan
-    font besar agar terbaca di bawah sinar matahari. Window 1240x840.
+    Thruster yang namanya diawali "Kiri"/"Kanan" dihitung untuk putaran,
+    "Vertikal" untuk kedalaman.
 
 ASUMSI
     Batas WARNING suhu (40 °C), baterai (30 %), dan kedalaman (8 m, batas
-    maks 10 m) tidak ada di studi kasus dan ditetapkan sendiri. Konsumsi
-    baterai saat naik 0.4 % per meter dan laju naik maksimal 0.8 m/tick
-    juga asumsi untuk simulasi.
+    maks 10 m) tidak ada di studi kasus dan ditetapkan sendiri. Laju gerak
+    dan konsumsi baterai auto ascent juga asumsi untuk simulasi.
 """
 
 import json
+import math
 import random
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -71,37 +92,38 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # 1. KONSTANTA
 # ---------------------------------------------------------------------------
-# Palet kontras tinggi untuk pemakaian outdoor
-BG = "#e8e2da"
+# Palet outdoor: latar terang, teks hampir hitam, aksen berkekuatan tinggi
+BG = "#ecebe5"
 CARD = "#ffffff"
-BORDER = "#8a7468"
-BROWN = "#3d2418"
-BROWN_ACTIVE = "#1f120c"
-CREAM = "#fff6ec"
-TEXT = "#1f1510"
-MUTED = "#5f4d43"
-GREEN = "#1e7a3e"
-AMBER = "#a35f00"
+BORDER = "#5f5a52"
+INK = "#0d0d0d"
+INK_MUTED = "#494440"
+ACCENT = "#ffd400"
+ACCENT_ACTIVE = "#e8c000"
+SOFT = "#e6e2d8"
+GREEN = "#0b6b2c"
+AMBER = "#7a4a00"
 RED = "#b3261e"
 RED_ACTIVE = "#8c1c16"
-LOG_BG = "#1b110c"
-LOG_RED = "#ff8a7a"
-LOG_GREEN = "#7bffa8"
-LOG_AMBER = "#ffd24a"
+HEADER_BG = "#ffffff"
+LOG_BG = "#ffffff"
+LOG_RED = "#a4161a"
+LOG_GREEN = "#0b6b2c"
+LOG_AMBER = "#7a4a00"
 
 # Warna latar kartu sesuai kategori sensor
-CARD_TINTS = {"NORMAL": CARD, "WARNING": "#fff3d1", "BAHAYA": "#ffdfda"}
-MOTOR_ACTIVE_BG = "#e4f6ea"
+CARD_TINTS = {"NORMAL": CARD, "WARNING": "#fff0b3", "BAHAYA": "#ffd6d1"}
+MOTOR_ACTIVE_BG = "#d8f5df"
 
-# Font besar agar terbaca di luar ruangan
+# Font: satu keluarga, beberapa ukuran
 FONT = "Segoe UI"
-F_MINI = (FONT, 9, "bold")
-F_SMALL = (FONT, 11)
-F_BOLD = (FONT, 11, "bold")
-F_TITLE = (FONT, 16, "bold")
-F_MOTOR = (FONT, 17, "bold")
-F_VALUE = (FONT, 22, "bold")
-F_KILL = (FONT, 16, "bold")
+F_MINI = (FONT, 8, "bold")
+F_SMALL = (FONT, 10)
+F_BOLD = (FONT, 10, "bold")
+F_TITLE = (FONT, 14, "bold")
+F_MOTOR = (FONT, 15, "bold")
+F_VALUE = (FONT, 19, "bold")
+F_KILL = (FONT, 15, "bold")
 
 # Batas keselamatan (studi kasus) dan batas peringatan (asumsi)
 TEMP_WARN = 40.0
@@ -118,18 +140,22 @@ LINK_TIMEOUT = 2.0
 TICK_MS = 500
 CMD_FILE = "perintah_rov.txt"
 
-# Model simulasi sederhana
+# Model simulasi termal dan baterai
 SIM_TEMP_BASE = 28.0
 SIM_COOL_RATE = 0.002
 SIM_HEAT_PER_SPEED = 0.0002
 SIM_BATT_IDLE_DRAIN = 0.01
 SIM_BATT_LOAD_DRAIN = 0.0003
 
+# Model gerak: meter per tick pada 100 % dan derajat per tick
+MAX_VERTICAL_RATE = 0.35
+MAX_SURGE_RATE = 0.5
+MAX_TURN_RATE = 6.0
+
 # Auto ascent: konsumsi baterai per meter dan batas laju naik
 BATT_PER_METER = 0.4
-ASCENT_RATE_MIN = 0.15
-ASCENT_RATE_MAX = 0.8
-ASCENT_MOTOR_SPEED = 60
+ASCENT_RATE_MIN = 0.08
+ASCENT_RATE_MAX = MAX_VERTICAL_RATE
 
 THRUSTERS = [
     "Kiri Depan",
@@ -138,15 +164,22 @@ THRUSTERS = [
     "Kanan Belakang",
     "Vertikal",
 ]
-# Thruster vertikal bergerak naik/turun, bukan maju/mundur
-THRUSTER_DIRECTIONS = {
-    "Kiri Depan": ("Maju", "Mundur"),
-    "Kanan Depan": ("Maju", "Mundur"),
-    "Kiri Belakang": ("Maju", "Mundur"),
-    "Kanan Belakang": ("Maju", "Mundur"),
-    "Vertikal": ("Naik", "Turun"),
+HORIZONTAL = ("Kiri Depan", "Kanan Depan", "Kiri Belakang", "Kanan Belakang")
+VERTICAL = "Vertikal"
+# Perintah gerak ROV dan thruster yang digerakkan beserta arahnya.
+# Kiri/Kanan adalah putaran (yaw): sisi kiri mundur + sisi kanan maju = kiri.
+MOTION_MAP = {
+    "Maju": {name: "Maju" for name in HORIZONTAL},
+    "Mundur": {name: "Mundur" for name in HORIZONTAL},
+    "Kiri": {"Kiri Depan": "Mundur", "Kiri Belakang": "Mundur",
+             "Kanan Depan": "Maju", "Kanan Belakang": "Maju"},
+    "Kanan": {"Kiri Depan": "Maju", "Kiri Belakang": "Maju",
+              "Kanan Depan": "Mundur", "Kanan Belakang": "Mundur"},
+    "Naik": {VERTICAL: "Naik"},
+    "Turun": {VERTICAL: "Turun"},
 }
-DEFAULT_DIRECTIONS = ("Maju", "Mundur")
+MOTION_ORDER = ("Maju", "Mundur", "Kiri", "Kanan", "Naik", "Turun")
+DEFAULT_MOTIONS = ("Maju", "Mundur")
 
 # Sensor: kunci -> (label, satuan, nilai awal)
 SENSOR_SPECS = {
@@ -157,6 +190,13 @@ SENSOR_SPECS = {
 LEVEL_COLORS = {"NORMAL": GREEN, "WARNING": AMBER, "BAHAYA": RED}
 LEVEL_TAGS = {"NORMAL": "green", "WARNING": "amber", "BAHAYA": "red"}
 LEVEL_RANK = {"NORMAL": 0, "WARNING": 1, "BAHAYA": 2}
+
+SCENARIO_LABELS = (
+    "Kondisi Normal",
+    "Suhu Air > 45 °C",
+    "Baterai < 15 % (di permukaan)",
+    "Baterai < 15 % (di dalam air)",
+)
 
 
 def categorize(key, value):
@@ -194,11 +234,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("GCS ROV - Dashboard Terintegrasi")
-        self.geometry("1240x840")
-        self.minsize(1240, 800)
+        self.geometry("1280x720")
+        self.minsize(1024, 680)
         self.configure(bg=BG)
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=3)
+        self.grid_rowconfigure(2, weight=2)
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
 
         self.started_at = datetime.now()
@@ -212,7 +253,8 @@ class App(tk.Tk):
         self.sensor = {key: spec[2] for key, spec in SENSOR_SPECS.items()}
         self.levels = {key: categorize(key, self.sensor[key])
                        for key in SENSOR_SPECS}
-        self.telemetry = {"heading": 180.0, "pitch": 0.0, "roll": 0.0}
+        self.telemetry = {"heading": 180.0, "pitch": 0.0, "roll": 0.0,
+                          "x": 0.0, "y": 0.0}
         self.motor = {name: {"speed": 0, "dir": "-"} for name in THRUSTERS}
 
         # Keselamatan: kunci kontrol, override manual, dan auto ascent
@@ -220,16 +262,18 @@ class App(tk.Tk):
         self.lock_reason = ""
         self.override_hazard = False
         self.auto_ascent = False
-        self.ascent_rate = 0.5
+        self.ascent_rate = 0.2
+        self.ascent_blocked = False
 
         self.thruster_var = tk.StringVar(value="")
         self.speed_var = tk.IntVar(value=0)
         self.direction_var = tk.StringVar(value=DEFAULT_DIRECTIONS[0])
-        self.scenario_var = tk.StringVar(value="Kondisi Normal")
+        self.scenario_var = tk.StringVar(value=SCENARIO_LABELS[0])
         self.scenario_actions = {
-            "Kondisi Normal": self.scenario_normal,
-            "Baterai < 15 %": self.scenario_low_battery,
-            "Suhu 46 °C": self.scenario_hot,
+            SCENARIO_LABELS[0]: self.scenario_normal,
+            SCENARIO_LABELS[1]: self.scenario_hot,
+            SCENARIO_LABELS[2]: self.scenario_battery_surface,
+            SCENARIO_LABELS[3]: self.scenario_battery_submerged,
         }
 
         self.cards = {}
@@ -240,12 +284,16 @@ class App(tk.Tk):
         self.btn_apply_scenario = None
         self.btn_link = None
         self.btn_unlock = None
+        self.ctrl_frame = None
+        self.box_pick = None
+        self.box_speed = None
+        self.box_drive = None
+        self._control_narrow = None
         self._job = None
 
         self._setup_style()
         self._build_header()
         self._build_main()
-        self._build_kill_switch()
         self._build_log()
         self._build_status_bar()
         self._apply_mode_widgets()
@@ -257,225 +305,286 @@ class App(tk.Tk):
     # 4. PEMBANGUNAN UI
     # -----------------------------------------------------------------
     def _setup_style(self):
-        """Mengatur tema kontras tinggi untuk widget ttk."""
+        """Mengatur tema terang kontras tinggi untuk widget ttk."""
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(".", background=BG, foreground=TEXT, font=F_SMALL)
+        style.configure(".", background=BG, foreground=INK, font=F_SMALL)
         style.configure("TLabelframe", background=CARD, bordercolor=BORDER,
                         borderwidth=2)
-        style.configure("TLabelframe.Label", background=CARD,
-                        foreground=BROWN, font=F_BOLD)
+        style.configure("TLabelframe.Label", background=CARD, foreground=INK,
+                        font=F_BOLD)
         style.configure("TFrame", background=CARD)
-        style.configure("TLabel", background=CARD, foreground=TEXT,
+        style.configure("TLabel", background=CARD, foreground=INK,
                         font=F_SMALL)
-        style.configure("Brown.TButton", background=BROWN, foreground=CREAM,
-                        font=F_BOLD, padding=8, borderwidth=0)
-        style.map("Brown.TButton", background=[("active", BROWN_ACTIVE),
-                                               ("disabled", BORDER)],
-                  foreground=[("disabled", MUTED)])
-        style.configure("Vertical.TScrollbar", background=BORDER,
+        style.configure("Primary.TButton", background=ACCENT,
+                        foreground=INK, font=F_BOLD, padding=6,
+                        borderwidth=0)
+        style.map("Primary.TButton",
+                  background=[("active", ACCENT_ACTIVE),
+                              ("disabled", SOFT)],
+                  foreground=[("disabled", INK_MUTED)])
+        style.configure("Vertical.TScrollbar", background=SOFT,
                         troughcolor=CARD, width=16)
 
     def _build_header(self):
-        """Judul, pemilih mode, status LINK, status sistem, dan jam."""
-        bar = tk.Frame(self, bg=BROWN)
-        bar.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        """Judul, mode, skenario uji, LINK, status sistem, dan jam."""
+        bar = tk.Frame(self, bg=HEADER_BG, highlightthickness=2,
+                       highlightbackground=BORDER)
+        bar.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
         bar.grid_columnconfigure(0, weight=1)
 
-        tk.Label(bar, text="GCS ROV - DASHBOARD TERINTEGRASI", bg=BROWN,
-                 fg=CREAM, font=F_TITLE).grid(row=0, column=0, sticky="w",
-                                              padx=10, pady=8)
+        tk.Label(bar, text="GCS ROV - DASHBOARD TERINTEGRASI", bg=HEADER_BG,
+                 fg=INK, font=F_TITLE).grid(row=0, column=0, sticky="w",
+                                            padx=10, pady=4)
 
-        mode_box = tk.Frame(bar, bg=BROWN)
+        mode_box = tk.Frame(bar, bg=HEADER_BG)
         mode_box.grid(row=0, column=1, padx=6)
         self.btn_sim = tk.Button(mode_box, text="SIMULASI", font=F_BOLD,
-                                 relief="flat", padx=14, pady=6,
+                                 relief="flat", padx=12, pady=4,
                                  cursor="hand2", command=self.set_mode_sim)
         self.btn_sim.grid(row=0, column=0, padx=(0, 4))
         self.btn_real = tk.Button(mode_box, text="REAL", font=F_BOLD,
-                                  relief="flat", padx=14, pady=6,
+                                  relief="flat", padx=12, pady=4,
                                   cursor="hand2", command=self.set_mode_real)
         self.btn_real.grid(row=0, column=1)
 
-        self.lbl_link = tk.Label(bar, bg=BROWN, fg=CREAM, font=F_BOLD,
-                                 padx=10)
+        self.lbl_link = tk.Label(bar, bg=HEADER_BG, fg=INK, font=F_BOLD,
+                                 padx=8)
         self.lbl_link.grid(row=0, column=2, padx=4)
         self.lbl_system = tk.Label(bar, bg=GREEN, fg="white", font=F_BOLD,
                                    padx=10, pady=4)
         self.lbl_system.grid(row=0, column=3, padx=4)
-        self.lbl_clock = tk.Label(bar, bg=BROWN, fg=CREAM, font=F_BOLD,
-                                  padx=10)
+        self.lbl_clock = tk.Label(bar, bg=HEADER_BG, fg=INK, font=F_BOLD,
+                                  padx=8)
         self.lbl_clock.grid(row=0, column=4, padx=6)
 
-        # Baris kedua header: pemilih skenario uji dan tombol link
-        scen_row = tk.Frame(bar, bg=BROWN)
+        # Baris kedua header: skenario uji, link, dan status kunci kontrol
+        scen_row = tk.Frame(bar, bg=HEADER_BG)
         scen_row.grid(row=1, column=0, columnspan=5, sticky="ew", padx=10,
-                      pady=(0, 8))
-        tk.Label(scen_row, text="SKENARIO UJI:", bg=BROWN, fg=CREAM,
+                      pady=(0, 6))
+        scen_row.grid_columnconfigure(5, weight=1)
+        tk.Label(scen_row, text="SKENARIO UJI:", bg=HEADER_BG, fg=INK,
                  font=F_BOLD).grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.scenario_combo = ttk.Combobox(
             scen_row, textvariable=self.scenario_var,
-            values=list(self.scenario_actions), state="readonly", width=22,
+            values=list(SCENARIO_LABELS), state="readonly", width=26,
             font=F_SMALL)
         self.scenario_combo.grid(row=0, column=1, sticky="w")
         self.btn_apply_scenario = tk.Button(
             scen_row, text="TERAPKAN", command=self.apply_scenario,
-            bg=CREAM, fg=BROWN, activebackground=CARD,
-            activeforeground=BROWN, font=F_BOLD, relief="flat", padx=12,
-            pady=4, cursor="hand2")
+            bg=ACCENT, fg=INK, activebackground=ACCENT_ACTIVE,
+            activeforeground=INK, font=F_BOLD, relief="flat", padx=12,
+            pady=3, cursor="hand2")
         self.btn_apply_scenario.grid(row=0, column=2, sticky="w", padx=6)
         self.btn_link = tk.Button(
             scen_row, text="Putuskan Link", command=self.toggle_link,
-            bg=BROWN_ACTIVE, fg=CREAM, activebackground=RED,
-            activeforeground="white", font=F_BOLD, relief="flat", padx=12,
-            pady=4, cursor="hand2")
+            bg=SOFT, fg=INK, activebackground=ACCENT,
+            activeforeground=INK, font=F_BOLD, relief="flat", padx=12,
+            pady=3, cursor="hand2")
         self.btn_link.grid(row=0, column=3, sticky="w", padx=6)
-        tk.Label(scen_row, text="(hanya mode SIMULASI)", bg=BROWN,
-                 fg=CREAM, font=F_SMALL).grid(row=0, column=4, sticky="w",
-                                              padx=6)
+        self.lbl_lock = tk.Label(scen_row, text="KONTROL: TERBUKA",
+                                 bg=HEADER_BG, fg=GREEN, font=F_BOLD)
+        self.lbl_lock.grid(row=0, column=5, sticky="e", padx=6)
 
     def _build_main(self):
-        """Kiri: monitoring sensor. Kanan: kontrol thruster."""
+        """Kiri: monitoring. Kanan: kontrol thruster dan kill switch."""
         main = tk.Frame(self, bg=BG)
         main.grid(row=1, column=0, sticky="nsew", padx=6)
         main.grid_rowconfigure(0, weight=1)
-        main.grid_columnconfigure(0, weight=1, uniform="kolom")
-        main.grid_columnconfigure(1, weight=1, uniform="kolom")
+        main.grid_columnconfigure(0, weight=5)
+        main.grid_columnconfigure(1, weight=4)
         self._build_sensor_panel(main)
-        self._build_control_panel(main)
+        self._build_control_column(main)
 
     def _build_sensor_panel(self, parent):
-        """Kartu sensor berkategori, telemetri, dan skenario uji."""
-        frame = ttk.LabelFrame(parent, text="MONITORING SENSOR", padding=6)
-        frame.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        """Kartu sensor, telemetri orientasi, dan status tiap thruster."""
+        frame = ttk.LabelFrame(parent, text="MONITORING SENSOR & THRUSTER",
+                               padding=6)
+        frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         for col in range(len(SENSOR_SPECS)):
-            frame.grid_columnconfigure(col, weight=1, uniform="kartu")
+            frame.grid_columnconfigure(col, weight=1, uniform="sensor")
+        frame.grid_rowconfigure(0, weight=1, minsize=112)
+        frame.grid_rowconfigure(3, weight=1, minsize=118)
 
         for col, (key, spec) in enumerate(SENSOR_SPECS.items()):
-            card = tk.Frame(frame, bg=CARD, highlightthickness=3,
-                            highlightbackground=BORDER)
-            card.grid(row=0, column=col, sticky="nsew", padx=3, pady=3)
-            title = tk.Label(card, text=spec[0].upper(), bg=CARD, fg=MUTED,
-                             font=F_BOLD, anchor="w")
-            title.pack(fill="x", padx=6, pady=(6, 0))
-            value = tk.Label(card, text="-", bg=CARD, fg=TEXT, font=F_VALUE,
-                             anchor="w")
-            value.pack(fill="x", padx=6)
-            badge = tk.Label(card, text="-", bg=CARD, fg=MUTED, font=F_BOLD,
-                             anchor="w")
-            badge.pack(fill="x", padx=6, pady=(0, 6))
-            self.cards[key] = {"frame": card, "title": title, "value": value,
-                               "badge": badge}
+            self._build_sensor_card(frame, col, key, spec)
 
-        self.lbl_telemetry = tk.Label(frame, bg=CARD, fg=TEXT, font=F_BOLD,
+        self.lbl_telemetry = tk.Label(frame, bg=CARD, fg=INK, font=F_BOLD,
                                       anchor="w")
         self.lbl_telemetry.grid(row=1, column=0, columnspan=3, sticky="ew",
                                 padx=3, pady=(6, 0))
+        self.lbl_position = tk.Label(frame, bg=CARD, fg=INK_MUTED,
+                                     font=F_SMALL, anchor="w")
+        self.lbl_position.grid(row=2, column=0, columnspan=3, sticky="ew",
+                               padx=3)
 
-        self.lbl_source = tk.Label(frame, bg=CARD, fg=MUTED, font=F_SMALL,
-                                   anchor="w", justify="left")
-        self.lbl_source.grid(row=2, column=0, columnspan=3, sticky="ew",
-                             padx=3, pady=(8, 0))
+        self._build_motor_status(frame, row=3)
 
-    def _build_control_panel(self, parent):
-        """Tiga blok kontrol, lalu kartu status tiap thruster."""
-        frame = ttk.LabelFrame(parent, text="KONTROL THRUSTER", padding=6)
-        frame.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
-        frame.grid_rowconfigure(0, weight=1)
-        frame.grid_columnconfigure(2, weight=1)
+        self.lbl_source = tk.Label(frame, bg=CARD, fg=INK_MUTED,
+                                   font=F_SMALL, anchor="w", justify="left")
+        self.lbl_source.grid(row=4, column=0, columnspan=3, sticky="ew",
+                             padx=3, pady=(6, 0))
 
-        self._build_thruster_picker(frame)
-        self._build_speed_slider(frame)
-        self._build_drive_panel(frame)
-        self._build_motor_status(frame)
+    def _build_sensor_card(self, parent, col, key, spec):
+        """Satu kartu sensor: judul, nilai besar, dan badge kategori."""
+        card = tk.Frame(parent, bg=CARD, highlightthickness=3,
+                        highlightbackground=BORDER)
+        card.grid(row=0, column=col, sticky="nsew", padx=3, pady=3)
+        card.grid_columnconfigure(0, weight=1)
+        title = tk.Label(card, text=spec[0].upper(), bg=CARD, fg=INK_MUTED,
+                         font=F_BOLD, anchor="w")
+        title.grid(row=0, column=0, sticky="ew", padx=6, pady=(5, 0))
+        value = tk.Label(card, text="-", bg=CARD, fg=INK, font=F_VALUE,
+                         anchor="w")
+        value.grid(row=1, column=0, sticky="ew", padx=6)
+        badge = tk.Label(card, text="-", bg=CARD, fg=INK_MUTED, font=F_BOLD,
+                         anchor="w")
+        badge.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 5))
+        self.cards[key] = {"frame": card, "title": title, "value": value,
+                           "badge": badge}
 
-    def _build_thruster_picker(self, parent):
-        """Tombol pilih thruster: satu klik, langsung terlihat terpilih."""
-        box = ttk.LabelFrame(parent, text="1. PILIH THRUSTER", padding=6)
-        box.grid(row=0, column=0, sticky="ns", padx=6)
-        for idx, name in enumerate(THRUSTERS):
-            row, col = divmod(idx, 2)
-            span = 2 if idx == len(THRUSTERS) - 1 else 1
-            btn = tk.Button(box, text=name, font=F_BOLD, width=13,
-                            relief="groove", bd=2, bg=CARD, fg=TEXT,
-                            activebackground=CREAM, activeforeground=TEXT,
-                            cursor="hand2",
-                            command=lambda n=name: self._select_thruster(n))
-            btn.grid(row=row, column=col, columnspan=span, sticky="ew",
-                     padx=3, pady=3)
-            self.thruster_toggles.append((btn, self.thruster_var, name))
-
-    def _build_speed_slider(self, parent):
-        """Slider kecepatan vertikal 0-100 % dengan tombol langkah."""
-        box = ttk.LabelFrame(parent, text="2. KECEPATAN", padding=6)
-        box.grid(row=0, column=1, sticky="ns", padx=6)
-        tk.Scale(box, from_=SPEED_MAX, to=0, orient="vertical",
-                 variable=self.speed_var, showvalue=False, length=170,
-                 width=26, bg=CARD, fg=TEXT, troughcolor=BORDER,
-                 activebackground=BROWN, highlightthickness=0,
-                 sliderrelief="raised", bd=2,
-                 command=lambda _v: self._refresh_display()).grid(
-            row=0, column=0, columnspan=3, pady=(0, 6))
-        for col, (text, delta) in enumerate(
-                (("-5", -SPEED_STEP), ("0", -SPEED_MAX),
-                 ("+5", SPEED_STEP))):
-            ttk.Button(box, text=text, style="Brown.TButton", width=4,
-                       command=lambda d=delta: self._step_speed(d)).grid(
-                row=1, column=col, padx=2)
-        self.lbl_target = tk.Label(box, bg=CARD, fg=BROWN, font=F_BOLD)
-        self.lbl_target.grid(row=2, column=0, columnspan=3, pady=(6, 0))
-
-    def _build_drive_panel(self, parent):
-        """Arah putaran, tombol kirim, override, dan kecepatan aktual."""
-        box = ttk.LabelFrame(parent, text="3. ARAH & KIRIM", padding=6)
-        box.grid(row=0, column=2, sticky="nsew", padx=6)
-        box.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(box, text="ARAH PUTARAN").grid(row=0, column=0,
-                                                 sticky="w", pady=(0, 4))
-        self.dir_box = ttk.Frame(box)
-        self.dir_box.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        self._rebuild_directions(DEFAULT_DIRECTIONS)
-
-        self.btn_send = ttk.Button(box, text="KIRIM PERINTAH",
-                                   style="Brown.TButton",
-                                   command=self.send_command)
-        self.btn_send.grid(row=2, column=0, sticky="ew", pady=(0, 4))
-
-        self.btn_unlock = ttk.Button(box, text="TIDAK ADA KENDALA",
-                                     style="Brown.TButton",
-                                     command=self.unlock_controls)
-        self.btn_unlock.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-
-        tk.Label(box, text="KECEPATAN AKTUAL", bg=CARD, fg=MUTED,
-                 font=F_BOLD, anchor="w").grid(row=4, column=0, sticky="ew")
-        self.lbl_speed = tk.Label(box, bg=CARD, fg=BROWN, font=F_VALUE,
-                                  anchor="w")
-        self.lbl_speed.grid(row=5, column=0, sticky="ew")
-
-    def _build_motor_status(self, parent):
-        """Kartu status tiap thruster: nama, kecepatan, dan arah."""
+    def _build_motor_status(self, parent, row):
+        """Kartu status tiap thruster di bagian monitoring."""
         box = ttk.LabelFrame(parent, text="STATUS THRUSTER (AKTUAL)",
                              padding=6)
-        box.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6,
+        box.grid(row=row, column=0, columnspan=3, sticky="nsew", padx=3,
                  pady=(6, 0))
+        box.grid_rowconfigure(0, weight=1, minsize=104)
         for col in range(len(THRUSTERS)):
             box.grid_columnconfigure(col, weight=1, uniform="motor")
 
         for col, name in enumerate(THRUSTERS):
             card = tk.Frame(box, bg=CARD, highlightthickness=2,
                             highlightbackground=BORDER)
-            card.grid(row=0, column=col, sticky="nsew", padx=3, pady=3)
-            title = tk.Label(card, text=name.upper(), bg=CARD, fg=MUTED,
-                             font=F_MINI, anchor="w")
-            title.pack(fill="x", padx=5, pady=(5, 0))
-            value = tk.Label(card, text="0 %", bg=CARD, fg=TEXT,
-                             font=F_MOTOR, anchor="w")
-            value.pack(fill="x", padx=5)
-            direction = tk.Label(card, text="-", bg=CARD, fg=MUTED,
-                                 font=F_SMALL, anchor="w")
-            direction.pack(fill="x", padx=5, pady=(0, 5))
+            card.grid(row=0, column=col, sticky="nsew", padx=2, pady=2)
+            card.grid_columnconfigure(0, weight=1)
+            title = tk.Label(card, text=name.upper(), bg=CARD, fg=INK_MUTED,
+                             font=F_MINI, anchor="center", justify="center",
+                             wraplength=90)
+            title.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
+            value = tk.Label(card, text="0 %", bg=CARD, fg=INK,
+                             font=F_MOTOR, anchor="center")
+            value.grid(row=1, column=0, sticky="ew", padx=4)
+            direction = tk.Label(card, text="-", bg=CARD, fg=INK_MUTED,
+                                 font=F_SMALL, anchor="center")
+            direction.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 4))
             self.motor_cards[name] = (card, title, value, direction)
+
+    def _build_control_column(self, parent):
+        """Panel kontrol di atas, kill switch menonjol tepat di bawahnya."""
+        column = tk.Frame(parent, bg=BG)
+        column.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
+        column.grid_rowconfigure(0, weight=1)
+        column.grid_columnconfigure(0, weight=1)
+
+        self.ctrl_frame = ttk.LabelFrame(column, text="KONTROL THRUSTER",
+                                        padding=6)
+        self.ctrl_frame.grid(row=0, column=0, sticky="nsew")
+        self.ctrl_frame.grid_rowconfigure(0, weight=1)
+        self.ctrl_frame.grid_rowconfigure(1, weight=1)
+        for col in range(3):
+            self.ctrl_frame.grid_columnconfigure(col, weight=1)
+
+        self.box_pick = self._build_thruster_picker(self.ctrl_frame)
+        self.box_speed = self._build_speed_slider(self.ctrl_frame)
+        self.box_drive = self._build_drive_panel(self.ctrl_frame)
+        self._place_control(False)
+        self.ctrl_frame.bind("<Configure>", self._reflow_control)
+
+        tk.Button(column, text="KILL SWITCH / EMERGENCY STOP",
+                  command=self.kill_switch, bg=RED, fg="white",
+                  activebackground=RED_ACTIVE, activeforeground="white",
+                  font=F_KILL, relief="flat", bd=0, pady=12,
+                  cursor="hand2").grid(row=1, column=0, sticky="ew",
+                                       pady=(6, 0))
+
+    def _reflow_control(self, event):
+        """Memilih tata letak kontrol sesuai lebar panel."""
+        narrow = event.width < 620
+        if narrow != self._control_narrow:
+            self._control_narrow = narrow
+            self._place_control(narrow)
+
+    def _place_control(self, narrow):
+        """Menyusun tiga blok kontrol: sejajar atau bertumpuk."""
+        for box in (self.box_pick, self.box_speed, self.box_drive):
+            box.grid_forget()
+        self.box_pick.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
+        self.box_speed.grid(row=0, column=1, sticky="nsew", padx=3, pady=3)
+        if narrow:
+            self.box_drive.grid(row=1, column=0, columnspan=2,
+                                sticky="nsew", padx=3, pady=3)
+        else:
+            self.box_drive.grid(row=0, column=2, sticky="nsew", padx=3,
+                                pady=3)
+
+    def _build_thruster_picker(self, parent):
+        """Tombol pilih thruster: satu klik, langsung terlihat terpilih."""
+        box = ttk.LabelFrame(parent, text="1. PILIH THRUSTER", padding=6)
+        for idx, name in enumerate(THRUSTERS):
+            row, col = divmod(idx, 2)
+            span = 2 if idx == len(THRUSTERS) - 1 else 1
+            btn = tk.Button(box, text=name, font=F_BOLD, width=12,
+                            relief="groove", bd=2, bg=CARD, fg=INK,
+                            activebackground=SOFT, activeforeground=INK,
+                            cursor="hand2",
+                            command=lambda n=name: self._select_thruster(n))
+            btn.grid(row=row, column=col, columnspan=span, sticky="ew",
+                     padx=2, pady=2)
+            self.thruster_toggles.append((btn, self.thruster_var, name))
+        for col in range(2):
+            box.grid_columnconfigure(col, weight=1)
+        return box
+
+    def _build_speed_slider(self, parent):
+        """Slider kecepatan vertikal 0-100 % dengan tombol langkah."""
+        box = ttk.LabelFrame(parent, text="2. KECEPATAN", padding=6)
+        tk.Scale(box, from_=SPEED_MAX, to=0, orient="vertical",
+                 variable=self.speed_var, showvalue=False, length=120,
+                 width=22, bg=CARD, fg=INK, troughcolor=SOFT,
+                 activebackground=ACCENT, highlightthickness=0,
+                 sliderrelief="raised", bd=2,
+                 command=lambda _v: self._refresh_display()).grid(
+            row=0, column=0, columnspan=3, sticky="ns", pady=(0, 4))
+        for col, (text, delta) in enumerate(
+                (("-5", -SPEED_STEP), ("0", -SPEED_MAX),
+                 ("+5", SPEED_STEP))):
+            ttk.Button(box, text=text, style="Primary.TButton", width=3,
+                       command=lambda d=delta: self._step_speed(d)).grid(
+                row=1, column=col, padx=2)
+        self.lbl_target = tk.Label(box, bg=CARD, fg=INK, font=F_BOLD)
+        self.lbl_target.grid(row=2, column=0, columnspan=3, pady=(4, 0))
+        for col in range(3):
+            box.grid_columnconfigure(col, weight=1)
+        return box
+
+    def _build_drive_panel(self, parent):
+        """Arah putaran, tombol kirim, override, dan kecepatan aktual."""
+        box = ttk.LabelFrame(parent, text="3. ARAH & KIRIM", padding=6)
+        box.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(box, text="ARAH PUTARAN").grid(row=0, column=0,
+                                                 sticky="w", pady=(0, 2))
+        self.dir_box = ttk.Frame(box)
+        self.dir_box.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self._rebuild_directions(DEFAULT_DIRECTIONS)
+
+        self.btn_send = ttk.Button(box, text="KIRIM PERINTAH",
+                                   style="Primary.TButton",
+                                   command=self.send_command)
+        self.btn_send.grid(row=2, column=0, sticky="ew", pady=(0, 3))
+
+        self.btn_unlock = ttk.Button(box, text="TIDAK ADA KENDALA",
+                                     style="Primary.TButton",
+                                     command=self.unlock_controls)
+        self.btn_unlock.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+
+        tk.Label(box, text="KECEPATAN AKTUAL", bg=CARD, fg=INK_MUTED,
+                 font=F_BOLD, anchor="w").grid(row=4, column=0, sticky="ew")
+        self.lbl_speed = tk.Label(box, bg=CARD, fg=INK, font=F_VALUE,
+                                  anchor="w")
+        self.lbl_speed.grid(row=5, column=0, sticky="ew")
+        return box
 
     def _rebuild_directions(self, options):
         """Membuat ulang tombol arah sesuai thruster yang dipilih."""
@@ -484,8 +593,8 @@ class App(tk.Tk):
         self.dir_toggles = []
         for col, name in enumerate(options):
             btn = tk.Button(self.dir_box, text=name.upper(), font=F_BOLD,
-                            relief="groove", bd=2, bg=CARD, fg=TEXT,
-                            activebackground=CREAM, activeforeground=TEXT,
+                            relief="groove", bd=2, bg=CARD, fg=INK,
+                            activebackground=SOFT, activeforeground=INK,
                             cursor="hand2",
                             command=lambda n=name: self._select_direction(n))
             btn.grid(row=0, column=col, sticky="ew", padx=(0, 6))
@@ -493,26 +602,20 @@ class App(tk.Tk):
             self.dir_toggles.append((btn, self.direction_var, name))
         self._refresh_toggles(self.dir_toggles)
 
-    def _build_kill_switch(self):
-        """Tombol darurat selebar layar agar mudah ditemukan."""
-        tk.Button(self, text="KILL SWITCH / EMERGENCY STOP",
-                  command=self.kill_switch, bg=RED, fg="white",
-                  activebackground=RED_ACTIVE, activeforeground="white",
-                  font=F_KILL, relief="flat", bd=0, pady=10,
-                  cursor="hand2").grid(row=2, column=0, sticky="ew", padx=6,
-                                       pady=(0, 6))
-
     def _build_log(self):
         """Log aktivitas, tombol isi perintah, dan kolom kirim perintah."""
         frame = ttk.LabelFrame(self, text="LOG AKTIVITAS & KIRIM PERINTAH",
                                padding=6)
-        frame.grid(row=3, column=0, sticky="ew", padx=6, pady=6)
+        frame.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 4))
+        frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(frame, bg=LOG_BG, fg=CREAM, font=F_SMALL,
+        self.log_text = tk.Text(frame, bg=LOG_BG, fg=INK, font=F_SMALL,
                                 wrap="word", state="disabled", relief="flat",
-                                padx=6, pady=6, height=6,
-                                insertbackground=CREAM)
+                                padx=6, pady=4, height=4,
+                                highlightthickness=1,
+                                highlightbackground=BORDER,
+                                insertbackground=INK)
         scroll = ttk.Scrollbar(frame, orient="vertical",
                                command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
@@ -522,20 +625,20 @@ class App(tk.Tk):
         self.log_text.tag_configure("red", foreground=LOG_RED, font=F_BOLD)
         self.log_text.tag_configure("amber", foreground=LOG_AMBER)
         self.log_text.tag_configure("green", foreground=LOG_GREEN)
-        self.log_text.tag_configure("info", foreground=CREAM)
+        self.log_text.tag_configure("info", foreground=INK)
 
         self.cmd_entry = ttk.Entry(frame, font=F_SMALL)
-        self.cmd_entry.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.cmd_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.cmd_entry.bind("<Return>", lambda _e: self.send_raw())
-        ttk.Button(frame, text="Kirim", style="Brown.TButton",
+        ttk.Button(frame, text="Kirim", style="Primary.TButton",
                    command=self.send_raw).grid(row=1, column=1, padx=6,
-                                               pady=(6, 0))
-        ttk.Button(frame, text="Bersihkan Log", style="Brown.TButton",
+                                               pady=(4, 0))
+        ttk.Button(frame, text="Bersihkan Log", style="Primary.TButton",
                    command=self.clear_log).grid(row=1, column=2,
-                                                pady=(6, 0))
+                                                pady=(4, 0))
 
         quick = ttk.Frame(frame)
-        quick.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        quick.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         for col in range(4):
             quick.grid_columnconfigure(col, weight=1, uniform="quick")
         quick_specs = [
@@ -545,23 +648,24 @@ class App(tk.Tk):
             ("Isi: STOP", lambda: self._set_command("STOP")),
         ]
         for col, (text, cmd) in enumerate(quick_specs):
-            ttk.Button(quick, text=text, style="Brown.TButton",
+            ttk.Button(quick, text=text, style="Primary.TButton",
                        command=cmd).grid(row=0, column=col, sticky="ew",
                                          padx=3)
 
     def _build_status_bar(self):
         """Pesan status, info waktu operasi, dan tombol penutupan aplikasi."""
-        bar = tk.Frame(self, bg=BROWN)
-        bar.grid(row=4, column=0, sticky="ew")
+        bar = tk.Frame(self, bg=HEADER_BG, highlightthickness=2,
+                       highlightbackground=BORDER)
+        bar.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
         bar.grid_columnconfigure(0, weight=1)
-        self.lbl_status = tk.Label(bar, bg=BROWN, fg=CREAM, font=F_SMALL,
+        self.lbl_status = tk.Label(bar, bg=HEADER_BG, fg=INK, font=F_SMALL,
                                    anchor="w", padx=6, pady=4)
         self.lbl_status.grid(row=0, column=0, sticky="ew")
-        self.lbl_info = tk.Label(bar, bg=BROWN, fg=CREAM, font=F_SMALL,
-                                 padx=6)
+        self.lbl_info = tk.Label(bar, bg=HEADER_BG, fg=INK_MUTED,
+                                 font=F_SMALL, padx=6)
         self.lbl_info.grid(row=0, column=1, sticky="e")
         tk.Button(bar, text="TUTUP APLIKASI", command=self.close_app,
-                  bg=BROWN_ACTIVE, fg=CREAM, activebackground=RED,
+                  bg=SOFT, fg=INK, activebackground=RED,
                   activeforeground="white", font=F_BOLD, relief="flat",
                   padx=12, cursor="hand2").grid(row=0, column=2, padx=6,
                                                 pady=2)
@@ -590,20 +694,21 @@ class App(tk.Tk):
 
     @staticmethod
     def _refresh_toggles(toggles):
-        """Mewarnai tombol: terpilih cokelat teks krem, sisanya putih."""
+        """Mewarnai tombol: terpilih kuning dengan teks hitam, sisanya putih."""
         for btn, var, value in toggles:
             selected = var.get() == value
-            btn.configure(bg=BROWN if selected else CARD,
-                          fg=CREAM if selected else TEXT,
-                          activebackground=BROWN if selected else CREAM,
-                          activeforeground=CREAM if selected else TEXT,
+            btn.configure(bg=ACCENT if selected else CARD,
+                          fg=INK,
+                          activebackground=ACCENT_ACTIVE if selected
+                          else SOFT,
+                          activeforeground=INK,
                           relief="sunken" if selected else "groove")
 
     # -----------------------------------------------------------------
     # Mode simulasi / real
     # -----------------------------------------------------------------
     def set_mode_sim(self):
-        """Beralih ke mode simulasi: sensor dibangkitkan otomatis."""
+        """Beralih ke mode simulasi: sensor dan gerak dibangkitkan otomatis."""
         if self.mode == "SIMULASI":
             return
         self.mode = "SIMULASI"
@@ -611,7 +716,7 @@ class App(tk.Tk):
         self.link_cut = False
         self.last_data_time = datetime.now()
         self._apply_mode_widgets()
-        self.log("Mode diubah ke SIMULASI. Sensor dibangkitkan otomatis.",
+        self.log("Mode diubah ke SIMULASI. Sensor dan gerak otomatis.",
                  "info")
         self.set_status("Mode SIMULASI aktif")
 
@@ -644,13 +749,14 @@ class App(tk.Tk):
         for name, btn in (("SIMULASI", self.btn_sim),
                           ("REAL", self.btn_real)):
             selected = name == self.mode
-            btn.configure(bg=CREAM if selected else BROWN_ACTIVE,
-                          fg=BROWN if selected else CREAM,
-                          activebackground=CREAM if selected else BROWN_ACTIVE,
-                          activeforeground=BROWN if selected else CREAM)
+            btn.configure(bg=ACCENT if selected else SOFT,
+                          fg=INK,
+                          activebackground=ACCENT_ACTIVE if selected
+                          else SOFT,
+                          activeforeground=INK)
 
         if is_sim:
-            source = "Sumber data: simulasi otomatis (random walk 500 ms)"
+            source = "Sumber data: simulasi otomatis (gerak mengikuti motor)"
         else:
             name = self.real_path.replace("\\", "/").split("/")[-1]
             source = f"Sumber data: file {name}"
@@ -674,38 +780,83 @@ class App(tk.Tk):
         self._job = self.after(TICK_MS, self._tick)
 
     def _simulate_step(self):
-        """Mengubah nilai sensor sedikit demi sedikit secara acak."""
+        """Memperbarui suhu, baterai, dan posisi ROV setiap tick."""
         if self.link_cut:
             return
         if self.auto_ascent:
             self._step_auto_ascent()
             return
+
         total = sum(m["speed"] for m in self.motor.values())
         s = self.sensor
 
         # Suhu: memanas sesuai beban motor, mendingin ke suhu dasar
         heat = total * SIM_HEAT_PER_SPEED
         cool = (s["suhu"] - SIM_TEMP_BASE) * SIM_COOL_RATE
-        s["suhu"] = clamp(s["suhu"] + random.uniform(-0.1, 0.1) + heat
+        s["suhu"] = clamp(s["suhu"] + random.uniform(-0.05, 0.05) + heat
                           - cool, -5.0, 100.0)
 
         # Baterai: turun pelan, lebih cepat saat motor menyala
         drain = SIM_BATT_IDLE_DRAIN + total * SIM_BATT_LOAD_DRAIN
         s["baterai"] = clamp(s["baterai"] - drain, 0.0, 100.0)
 
-        # Kedalaman: berayun kecil di sekitar posisi kolam uji
-        s["kedalaman"] = clamp(s["kedalaman"] + random.uniform(-0.1, 0.1),
-                               0.0, 9.5)
-
-        self._simulate_orientation()
+        self._step_motion()
         self.last_data_time = datetime.now()
 
-    def _simulate_orientation(self):
-        """Mengubah heading, pitch, dan roll secara halus."""
+    def _step_motion(self):
+        """Menggerakkan ROV sesuai thruster yang sedang aktif.
+
+        Vertikal mengubah kedalaman, horizontal mengubah posisi, dan
+        selisih dorongan kiri/kanan memutar heading.
+        """
+        vert = 0.0
+        surge = 0.0
+        left = 0.0
+        right = 0.0
+        for name in THRUSTERS:
+            motor = self.motor[name]
+            if motor["speed"] <= 0:
+                continue
+            sign = 1 if motor["dir"] in ("Maju", "Naik") else -1
+            power = motor["speed"] / 100 * sign
+            if name == "Vertikal":
+                vert += power
+            else:
+                surge += power
+                if name.startswith("Kiri"):
+                    left += power
+                else:
+                    right += power
+
+        s = self.sensor
         t = self.telemetry
-        t["heading"] = (t["heading"] + random.uniform(-1.0, 1.0)) % 360
-        t["pitch"] = clamp(t["pitch"] + random.uniform(-0.3, 0.3), -20, 20)
-        t["roll"] = clamp(t["roll"] + random.uniform(-0.3, 0.3), -20, 20)
+
+        # Kedalaman hanya berubah bila thruster vertikal bergerak
+        if vert:
+            s["kedalaman"] = clamp(s["kedalaman"] - vert * MAX_VERTICAL_RATE,
+                                   0.0, DEPTH_MAX)
+            target_pitch = -6.0 if vert > 0 else 6.0
+        else:
+            s["kedalaman"] = clamp(
+                s["kedalaman"] + random.uniform(-0.01, 0.01),
+                0.0, DEPTH_MAX)
+            target_pitch = 0.0
+
+        # Selisih dorongan kiri dan kanan memutar heading
+        turn = (left - right) * MAX_TURN_RATE
+        t["heading"] = (t["heading"] + turn + random.uniform(-0.2, 0.2)) % 360
+
+        # Maju/mundur menggeser posisi sepanjang heading
+        if surge:
+            rad = math.radians(t["heading"])
+            step = surge * MAX_SURGE_RATE
+            t["x"] += step * math.sin(rad)
+            t["y"] += step * math.cos(rad)
+
+        t["pitch"] = clamp(t["pitch"] + (target_pitch - t["pitch"]) * 0.3
+                           + random.uniform(-0.1, 0.1), -25, 25)
+        t["roll"] = clamp(t["roll"] - turn * 0.6
+                          + random.uniform(-0.1, 0.1), -25, 25)
 
     def _step_auto_ascent(self):
         """Menaikkan ROV otomatis sampai permukaan sambil memakai baterai."""
@@ -713,13 +864,16 @@ class App(tk.Tk):
         s["kedalaman"] = max(0.0, s["kedalaman"] - self.ascent_rate)
         s["baterai"] = clamp(s["baterai"] - self.ascent_rate * BATT_PER_METER,
                              0.0, 100.0)
-        self.motor["Vertikal"] = {"speed": ASCENT_MOTOR_SPEED, "dir": "Naik"}
+        speed = int(clamp(self.ascent_rate / MAX_VERTICAL_RATE * 100, 1, 100))
+        self.motor["Vertikal"] = {"speed": speed, "dir": "Naik"}
         self.telemetry["pitch"] = -5.0
-        self._simulate_orientation()
+        self.telemetry["heading"] = (self.telemetry["heading"]
+                                     + random.uniform(-0.2, 0.2)) % 360
         self.last_data_time = datetime.now()
 
         if s["baterai"] <= 0:
             self.auto_ascent = False
+            self.ascent_blocked = True
             self.motor["Vertikal"] = {"speed": 0, "dir": "Naik"}
             self.log("BATERAI HABIS sebelum mencapai permukaan. "
                      f"ROV berhenti di {s['kedalaman']:.1f} m.", "red")
@@ -799,20 +953,24 @@ class App(tk.Tk):
                 self._lock_controls(" ".join(hazard))
             low_batt = self.sensor["baterai"] < BATT_MIN
             if low_batt and self.sensor["kedalaman"] > 0.2 \
-                    and not self.auto_ascent:
+                    and not self.auto_ascent and not self.ascent_blocked:
                 self._start_auto_ascent()
         elif self.control_locked or self.override_hazard:
             self.control_locked = False
             self.override_hazard = False
             self.lock_reason = ""
+            self.ascent_blocked = False
             self.log("Kondisi aman kembali. Kontrol dibuka otomatis.",
                      "green")
             self.set_status("Kontrol dibuka: kondisi sensor normal")
 
     def _lock_controls(self, reason):
-        """Mengunci seluruh kontrol dan mencatat alasannya."""
+        """Mengunci seluruh kontrol, menghentikan motor, dan mencatat alasan."""
         self.control_locked = True
         self.lock_reason = reason
+        for name in THRUSTERS:
+            self.motor[name] = {"speed": 0, "dir": "-"}
+        self.speed_var.set(0)
         self.log(f"KONTROL DIKUNCI: {reason}", "red")
         self.set_status("Kontrol dikunci oleh safety interlock")
 
@@ -821,6 +979,11 @@ class App(tk.Tk):
         depth = self.sensor["kedalaman"]
         battery = self.sensor["baterai"]
         needed = depth * BATT_PER_METER
+        if battery <= 0:
+            self.ascent_blocked = True
+            self.log("Baterai habis. Auto ascent tidak dapat dijalankan.",
+                     "red")
+            return
         self.ascent_rate = clamp(battery / 100 * ASCENT_RATE_MAX,
                                  ASCENT_RATE_MIN, ASCENT_RATE_MAX)
         ticks = int(depth / self.ascent_rate + 0.999)
@@ -861,46 +1024,71 @@ class App(tk.Tk):
         """Menjalankan skenario yang dipilih pada dropdown header."""
         if not self._sim_only():
             return
-        label = self.scenario_var.get()
-        action = self.scenario_actions.get(label)
+        action = self.scenario_actions.get(self.scenario_var.get())
         if action:
             action()
+        # Terapkan efek keselamatan dan tampilan saat itu juga
+        self._update_safety()
+        self._log_level_changes()
+        self._refresh_display()
 
-    def scenario_normal(self):
-        """Mengembalikan semua kondisi ke normal dan membuka kunci."""
-        if not self._sim_only():
-            return
-        self.sensor["suhu"] = SENSOR_SPECS["suhu"][2]
-        self.sensor["baterai"] = 90.0
-        self.sensor["kedalaman"] = 3.0
+    def _reset_conditions(self):
+        """Membuka kunci, menghentikan motor, dan membatalkan auto ascent."""
         self.auto_ascent = False
+        self.ascent_blocked = False
         self.control_locked = False
         self.override_hazard = False
         self.lock_reason = ""
         for name in THRUSTERS:
             self.motor[name] = {"speed": 0, "dir": "-"}
         self.speed_var.set(0)
+
+    def scenario_normal(self):
+        """Mengembalikan semua kondisi ke normal dan membuka kunci."""
+        if not self._sim_only():
+            return
+        self._reset_conditions()
+        self.sensor["suhu"] = SENSOR_SPECS["suhu"][2]
+        self.sensor["baterai"] = 90.0
+        self.sensor["kedalaman"] = 3.0
+        self.telemetry.update({"heading": 180.0, "pitch": 0.0, "roll": 0.0,
+                               "x": 0.0, "y": 0.0})
         self.log("SKENARIO: kondisi normal (suhu 28 °C, baterai 90 %, "
                  "kedalaman 3 m). Kontrol dibuka.", "info")
         self.set_status("Skenario kondisi normal diterapkan")
 
-    def scenario_low_battery(self):
+    def scenario_hot(self):
+        """Memaksa suhu air di atas 45 °C sehingga kontrol terkunci."""
+        if not self._sim_only():
+            return
+        self.override_hazard = False
+        self.sensor["suhu"] = 46.0
+        self.log("SKENARIO: suhu air 46 °C (di atas 45 °C). Kontrol akan "
+                 "dikunci.", "amber")
+        self.set_status("Skenario suhu tinggi diterapkan")
+
+    def scenario_battery_surface(self):
+        """Baterai 12 % di permukaan: kunci kontrol tanpa auto ascent."""
+        if not self._sim_only():
+            return
+        self.override_hazard = False
+        self.sensor["baterai"] = 12.0
+        self.sensor["kedalaman"] = 0.0
+        self.log("SKENARIO: baterai 12 % di permukaan. Kontrol dikunci, "
+                 "auto ascent tidak dijalankan.", "amber")
+        self.set_status("Skenario baterai rendah (permukaan) diterapkan")
+
+    def scenario_battery_submerged(self):
         """Baterai 12 % di kedalaman 6 m: memicu auto ascent."""
         if not self._sim_only():
             return
+        self.override_hazard = False
+        self.ascent_blocked = False
         self.sensor["baterai"] = 12.0
         self.sensor["kedalaman"] = 6.0
         self.log("SKENARIO: baterai 12 % di kedalaman 6 m. Auto ascent akan "
                  "dihitung dan dijalankan.", "amber")
-        self.set_status("Skenario baterai rendah diterapkan")
-
-    def scenario_hot(self):
-        """Memaksa suhu air di atas 45 °C."""
-        if not self._sim_only():
-            return
-        self.sensor["suhu"] = 46.0
-        self.log("SKENARIO: suhu air 46 °C (di atas 45 °C).", "amber")
-        self.set_status("Skenario suhu tinggi diterapkan")
+        self.set_status("Skenario baterai kritis (di dalam air) diterapkan")
 
     def toggle_link(self):
         """Memutus atau menyambung kembali data simulasi."""
@@ -997,24 +1185,35 @@ class App(tk.Tk):
             card["title"].configure(bg=tint)
             card["value"].configure(bg=tint,
                                     text=f"{self.sensor[key]:.1f} {spec[1]}",
-                                    fg=TEXT)
+                                    fg=INK)
             card["badge"].configure(bg=tint, text=level,
                                     fg=LEVEL_COLORS[level])
 
         t = self.telemetry
         self.lbl_telemetry.configure(
-            text=f"Heading {t['heading']:.0f}°    Pitch {t['pitch']:+.1f}°"
-                 f"    Roll {t['roll']:+.1f}°")
+            text=f"Heading {t['heading']:.0f}°   Pitch {t['pitch']:+.1f}°   "
+                 f"Roll {t['roll']:+.1f}°")
+        self.lbl_position.configure(
+            text=f"Posisi X {t['x']:+.1f} m   Y {t['y']:+.1f} m   "
+                 f"Kedalaman {self.sensor['kedalaman']:.1f} m")
 
     def _refresh_header_status(self):
-        """Memperbarui badge sistem dan indikator LINK."""
+        """Memperbarui badge sistem, indikator LINK, dan status kunci."""
         overall = self._overall_level()
         self.lbl_system.configure(text=f"SISTEM: {overall}",
                                   bg=LEVEL_COLORS[overall])
         if self.link_ok:
-            self.lbl_link.configure(text="LINK OK", fg=LOG_GREEN)
+            self.lbl_link.configure(text="LINK OK", fg=GREEN)
         else:
-            self.lbl_link.configure(text="LINK LOST", fg=LOG_RED)
+            self.lbl_link.configure(text="LINK LOST", fg=RED)
+        if self.auto_ascent:
+            self.lbl_lock.configure(text="KONTROL: AUTO NAIK", fg=RED)
+        elif self.control_locked:
+            self.lbl_lock.configure(text="KONTROL: TERKUNCI", fg=RED)
+        elif self.override_hazard:
+            self.lbl_lock.configure(text="KONTROL: OVERRIDE", fg=AMBER)
+        else:
+            self.lbl_lock.configure(text="KONTROL: TERBUKA", fg=GREEN)
 
     def _refresh_lock_button(self):
         """Mengatur tombol override sesuai kondisi bahaya dan auto ascent."""
@@ -1043,9 +1242,9 @@ class App(tk.Tk):
                            else BORDER)
             title.configure(bg=tint)
             value.configure(bg=tint, text=f"{motor['speed']} %",
-                            fg=GREEN if active else TEXT)
+                            fg=GREEN if active else INK)
             direction.configure(bg=tint, text=motor["dir"],
-                                fg=GREEN if active else MUTED)
+                                fg=GREEN if active else INK_MUTED)
 
         name = self.thruster_var.get()
         if name:
@@ -1119,7 +1318,7 @@ class App(tk.Tk):
         if current == SPEED_MAX and target == 0:
             return ("Penurunan langsung dari 100 % ke 0 % diblokir. "
                     "Turunkan secara bertahap atau gunakan KILL SWITCH.")
-        if target > 0:
+        if target > 0 and not self.override_hazard:
             reasons = self._danger_reasons()
             if reasons:
                 return " ".join(reasons) + " Motor tidak boleh menyala."
