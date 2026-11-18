@@ -32,19 +32,25 @@ ALUR KODE (untuk pengembangan lanjut)
                          scenario_normal / scenario_hot /
                          scenario_battery_surface / scenario_battery_submerged.
                          Tombol link memutus data. Hanya aktif di SIMULASI.
-    7. Pemilihan       : _select_thruster() mengganti opsi arah sesuai
-                         thruster (Vertikal memakai Naik/Turun).
+    7. Pemilihan       : thruster dipilih bebas (multi-pilih) lewat tombol.
+                         Arah gerak ROV (Maju/Mundur/Kiri/Kanan/Naik/Turun)
+                         dipetakan ke thruster lewat MOTION_MAP; hanya
+                         thruster yang dipilih dan ikut gerak yang digerakkan.
     8. Perintah        : send_command() -> _check_interlock() -> motor[]
                          -> log (dan _write_cmd() di mode REAL). Tombol
                          "Isi: ..." menyiapkan teks perintah di kolom log.
-    9. Darurat         : kill_switch() menghentikan semua thruster.
+    9. Darurat         : kill_switch() menghentikan semua thruster. Setelah
+                         itu tombol besar berubah menjadi AKTIFKAN KONTROL
+                         KEMBALI (rearm_controls) yang hanya aktif bila
+                         sensor sudah normal.
    10. Penutupan       : jendela tidak bisa ditutup dengan X; hanya lewat
                          tombol TUTUP APLIKASI (close_app()).
 
 MODEL GERAK SIMULASI
     - Thruster Vertikal (Naik/Turun) mengubah kedalaman.
     - Thruster horizontal Maju/Mundur menggeser posisi X/Y sepanjang heading.
-    - Selisih dorongan thruster kiri dan kanan memutar heading (differential).
+    - Kiri/Kanan adalah putaran (yaw): sisi kiri mundur dan sisi kanan maju
+      membuat ROV berputar ke kiri, dan sebaliknya.
     - Pitch mengikuti gerak vertikal, roll mengikuti laju putar.
 
 SKENARIO OTOMATIS SAAT BAHAYA
@@ -72,9 +78,10 @@ CARA MENAMBAH SENSOR
     logika simulasi di _simulate_step(). Kartu tampilan dibuat otomatis.
 
 CARA MENAMBAH THRUSTER
-    Tambahkan nama di THRUSTERS dan pasangan arahnya di THRUSTER_DIRECTIONS.
-    Thruster yang namanya diawali "Kiri"/"Kanan" dihitung untuk putaran,
-    "Vertikal" untuk kedalaman.
+    Tambahkan nama di THRUSTERS, lalu daftarkan perannya di MOTION_MAP untuk
+    setiap arah gerak yang relevan. Thruster yang namanya diawali
+    "Kiri"/"Kanan" dihitung untuk putaran, "Vertikal" untuk kedalaman.
+    Tombol pilih dan kartu status mengikuti otomatis.
 
 ASUMSI
     Batas WARNING suhu (40 °C), baterai (30 %), dan kedalaman (8 m, batas
@@ -257,17 +264,19 @@ class App(tk.Tk):
                           "x": 0.0, "y": 0.0}
         self.motor = {name: {"speed": 0, "dir": "-"} for name in THRUSTERS}
 
-        # Keselamatan: kunci kontrol, override manual, dan auto ascent
+        # Keselamatan: kunci kontrol, override manual, auto ascent, e-stop
         self.control_locked = False
         self.lock_reason = ""
         self.override_hazard = False
         self.auto_ascent = False
         self.ascent_rate = 0.2
         self.ascent_blocked = False
+        self.estop = False
 
-        self.thruster_var = tk.StringVar(value="")
+        # Thruster dipilih bebas (multi-pilih) lewat tombol di panel kontrol
+        self.selected = set()
         self.speed_var = tk.IntVar(value=0)
-        self.direction_var = tk.StringVar(value=DEFAULT_DIRECTIONS[0])
+        self.motion_var = tk.StringVar(value=MOTION_ORDER[0])
         self.scenario_var = tk.StringVar(value=SCENARIO_LABELS[0])
         self.scenario_actions = {
             SCENARIO_LABELS[0]: self.scenario_normal,
@@ -279,7 +288,8 @@ class App(tk.Tk):
         self.cards = {}
         self.motor_cards = {}
         self.thruster_toggles = []
-        self.dir_toggles = []
+        self.motion_toggles = []
+        self.btn_kill = None
         self.scenario_combo = None
         self.btn_apply_scenario = None
         self.btn_link = None
@@ -491,12 +501,13 @@ class App(tk.Tk):
         self._place_control(False)
         self.ctrl_frame.bind("<Configure>", self._reflow_control)
 
-        tk.Button(column, text="KILL SWITCH / EMERGENCY STOP",
-                  command=self.kill_switch, bg=RED, fg="white",
-                  activebackground=RED_ACTIVE, activeforeground="white",
-                  font=F_KILL, relief="flat", bd=0, pady=12,
-                  cursor="hand2").grid(row=1, column=0, sticky="ew",
-                                       pady=(6, 0))
+        self.btn_kill = tk.Button(column, text="KILL SWITCH / EMERGENCY STOP",
+                                  command=self.emergency_action, bg=RED,
+                                  fg="white", activebackground=RED_ACTIVE,
+                                  activeforeground="white", font=F_KILL,
+                                  relief="flat", bd=0, pady=12,
+                                  cursor="hand2")
+        self.btn_kill.grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
     def _reflow_control(self, event):
         """Memilih tata letak kontrol sesuai lebar panel."""
@@ -519,8 +530,9 @@ class App(tk.Tk):
                                 pady=3)
 
     def _build_thruster_picker(self, parent):
-        """Tombol pilih thruster: satu klik, langsung terlihat terpilih."""
-        box = ttk.LabelFrame(parent, text="1. PILIH THRUSTER", padding=6)
+        """Tombol thruster multi-pilih: boleh lebih dari satu menyala."""
+        box = ttk.LabelFrame(parent, text="1. PILIH THRUSTER (BISA >1)",
+                             padding=6)
         for idx, name in enumerate(THRUSTERS):
             row, col = divmod(idx, 2)
             span = 2 if idx == len(THRUSTERS) - 1 else 1
@@ -528,10 +540,13 @@ class App(tk.Tk):
                             relief="groove", bd=2, bg=CARD, fg=INK,
                             activebackground=SOFT, activeforeground=INK,
                             cursor="hand2",
-                            command=lambda n=name: self._select_thruster(n))
+                            command=lambda n=name: self._toggle_thruster(n))
             btn.grid(row=row, column=col, columnspan=span, sticky="ew",
                      padx=2, pady=2)
-            self.thruster_toggles.append((btn, self.thruster_var, name))
+            self.thruster_toggles.append((btn, name))
+        ttk.Button(box, text="Kosongkan Pilihan", style="Primary.TButton",
+                   command=self._clear_thrusters).grid(
+            row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=(4, 0))
         for col in range(2):
             box.grid_columnconfigure(col, weight=1)
         return box
@@ -559,15 +574,15 @@ class App(tk.Tk):
         return box
 
     def _build_drive_panel(self, parent):
-        """Arah putaran, tombol kirim, override, dan kecepatan aktual."""
-        box = ttk.LabelFrame(parent, text="3. ARAH & KIRIM", padding=6)
+        """Arah gerak ROV, tombol kirim, override, dan kecepatan aktual."""
+        box = ttk.LabelFrame(parent, text="3. ARAH GERAK & KIRIM", padding=6)
         box.grid_columnconfigure(0, weight=1)
 
-        ttk.Label(box, text="ARAH PUTARAN").grid(row=0, column=0,
-                                                 sticky="w", pady=(0, 2))
-        self.dir_box = ttk.Frame(box)
-        self.dir_box.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        self._rebuild_directions(DEFAULT_DIRECTIONS)
+        ttk.Label(box, text="ARAH GERAK ROV").grid(row=0, column=0,
+                                                   sticky="w", pady=(0, 2))
+        self.motion_box = ttk.Frame(box)
+        self.motion_box.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self._build_motion_buttons()
 
         self.btn_send = ttk.Button(box, text="KIRIM PERINTAH",
                                    style="Primary.TButton",
@@ -586,21 +601,20 @@ class App(tk.Tk):
         self.lbl_speed.grid(row=5, column=0, sticky="ew")
         return box
 
-    def _rebuild_directions(self, options):
-        """Membuat ulang tombol arah sesuai thruster yang dipilih."""
-        for child in self.dir_box.winfo_children():
-            child.destroy()
-        self.dir_toggles = []
-        for col, name in enumerate(options):
-            btn = tk.Button(self.dir_box, text=name.upper(), font=F_BOLD,
+    def _build_motion_buttons(self):
+        """Enam tombol arah gerak dalam dua baris tiga kolom."""
+        self.motion_toggles = []
+        for idx, name in enumerate(MOTION_ORDER):
+            row, col = divmod(idx, 3)
+            btn = tk.Button(self.motion_box, text=name.upper(), font=F_BOLD,
                             relief="groove", bd=2, bg=CARD, fg=INK,
                             activebackground=SOFT, activeforeground=INK,
                             cursor="hand2",
-                            command=lambda n=name: self._select_direction(n))
-            btn.grid(row=0, column=col, sticky="ew", padx=(0, 6))
-            self.dir_box.grid_columnconfigure(col, weight=1)
-            self.dir_toggles.append((btn, self.direction_var, name))
-        self._refresh_toggles(self.dir_toggles)
+                            command=lambda n=name: self._select_motion(n))
+            btn.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
+            self.motion_box.grid_columnconfigure(col, weight=1)
+            self.motion_toggles.append((btn, name))
+        self._refresh_motion_toggles()
 
     def _build_log(self):
         """Log aktivitas, tombol isi perintah, dan kolom kirim perintah."""
@@ -693,16 +707,22 @@ class App(tk.Tk):
         self.log("Log dibersihkan.", "info")
 
     @staticmethod
-    def _refresh_toggles(toggles):
-        """Mewarnai tombol: terpilih kuning dengan teks hitam, sisanya putih."""
-        for btn, var, value in toggles:
-            selected = var.get() == value
-            btn.configure(bg=ACCENT if selected else CARD,
-                          fg=INK,
-                          activebackground=ACCENT_ACTIVE if selected
-                          else SOFT,
-                          activeforeground=INK,
-                          relief="sunken" if selected else "groove")
+    def _paint_toggle(btn, selected):
+        """Mewarnai satu tombol: terpilih kuning, tidak terpilih putih."""
+        btn.configure(bg=ACCENT if selected else CARD, fg=INK,
+                      activebackground=ACCENT_ACTIVE if selected else SOFT,
+                      activeforeground=INK,
+                      relief="sunken" if selected else "groove")
+
+    def _refresh_thruster_toggles(self):
+        """Menandai tombol thruster yang sedang dipilih."""
+        for btn, name in self.thruster_toggles:
+            self._paint_toggle(btn, name in self.selected)
+
+    def _refresh_motion_toggles(self):
+        """Menandai tombol arah gerak yang sedang dipilih."""
+        for btn, name in self.motion_toggles:
+            self._paint_toggle(btn, self.motion_var.get() == name)
 
     # -----------------------------------------------------------------
     # Mode simulasi / real
@@ -947,6 +967,8 @@ class App(tk.Tk):
     # -----------------------------------------------------------------
     def _update_safety(self):
         """Mengunci kontrol saat BAHAYA dan memicu auto ascent baterai kritis."""
+        if self.estop:
+            return
         hazard = self._danger_reasons()
         if hazard:
             if not self.control_locked and not self.override_hazard:
@@ -1000,7 +1022,7 @@ class App(tk.Tk):
 
     def unlock_controls(self):
         """Override manual: membuka kunci saat masih ada bahaya."""
-        if not self._danger_reasons() or self.auto_ascent:
+        if self.estop or not self._danger_reasons() or self.auto_ascent:
             return
         self.control_locked = False
         self.override_hazard = True
@@ -1038,7 +1060,9 @@ class App(tk.Tk):
         self.ascent_blocked = False
         self.control_locked = False
         self.override_hazard = False
+        self.estop = False
         self.lock_reason = ""
+        self.selected.clear()
         for name in THRUSTERS:
             self.motor[name] = {"speed": 0, "dir": "-"}
         self.speed_var.set(0)
@@ -1108,29 +1132,40 @@ class App(tk.Tk):
     # -----------------------------------------------------------------
     # 7. PEMILIHAN THRUSTER, ARAH, DAN KECEPATAN
     # -----------------------------------------------------------------
-    def _select_thruster(self, name):
-        """Memilih thruster lalu menyesuaikan opsi arah dan target."""
-        self.thruster_var.set(name)
-        self._on_thruster_change()
-
-    def _select_direction(self, name):
-        """Memilih arah putaran lalu memperbarui warna tombol."""
-        self.direction_var.set(name)
-        self._refresh_toggles(self.dir_toggles)
-        self.set_status(f"Arah {name} dipilih")
-
-    def _on_thruster_change(self):
-        """Mengatur ulang target dan arah sesuai thruster yang dipilih."""
-        name = self.thruster_var.get()
-        options = THRUSTER_DIRECTIONS[name]
-        self.speed_var.set(0)
-        self.direction_var.set(options[0])
-        self._rebuild_directions(options)
-        self._refresh_toggles(self.thruster_toggles)
-        self.log(f"Thruster dipilih: {name}. Arah {options[0]}/{options[1]}, "
-                 f"target 0 %.", "info")
-        self.set_status(f"Thruster {name} dipilih")
+    def _toggle_thruster(self, name):
+        """Menambah atau melepas satu thruster dari pilihan (multi-pilih)."""
+        if name in self.selected:
+            self.selected.discard(name)
+        else:
+            self.selected.add(name)
+        self._refresh_thruster_toggles()
+        daftar = ", ".join(sorted(self.selected)) or "belum ada"
+        self.log(f"Thruster dipilih: {daftar}.", "info")
+        self.set_status(f"Thruster aktif: {daftar}")
         self._refresh_display()
+
+    def _clear_thrusters(self):
+        """Mengosongkan seluruh pilihan thruster."""
+        self.selected.clear()
+        self._refresh_thruster_toggles()
+        self.set_status("Pilihan thruster dikosongkan")
+        self._refresh_display()
+
+    def _select_motion(self, name):
+        """Memilih arah gerak ROV."""
+        self.motion_var.set(name)
+        self._refresh_motion_toggles()
+        self.set_status(f"Arah gerak {name} dipilih")
+
+    def _targets_for_motion(self):
+        """Pasangan thruster -> arah untuk gerak dan pilihan saat ini.
+
+        Thruster yang dipilih tetapi tidak ikut gerak (misalnya Vertikal saat
+        Maju) tidak akan digerakkan.
+        """
+        mapping = MOTION_MAP[self.motion_var.get()]
+        return {name: direction for name, direction in mapping.items()
+                if name in self.selected}
 
     def _step_speed(self, delta):
         """Mengubah target kecepatan dengan langkah tetap, dibatasi 0-100."""
@@ -1167,9 +1202,10 @@ class App(tk.Tk):
 
         self.lbl_target.configure(text=f"Target: {self.speed_var.get()} %")
         self._refresh_motor_view()
-        self._refresh_toggles(self.thruster_toggles)
-        self._refresh_toggles(self.dir_toggles)
+        self._refresh_thruster_toggles()
+        self._refresh_motion_toggles()
         self._refresh_lock_button()
+        self._refresh_kill_button()
         state = "normal" if self.link_ok and not self.control_locked \
             else "disabled"
         self.btn_send.configure(state=state)
@@ -1206,7 +1242,9 @@ class App(tk.Tk):
             self.lbl_link.configure(text="LINK OK", fg=GREEN)
         else:
             self.lbl_link.configure(text="LINK LOST", fg=RED)
-        if self.auto_ascent:
+        if self.estop:
+            self.lbl_lock.configure(text="KONTROL: E-STOP", fg=RED)
+        elif self.auto_ascent:
             self.lbl_lock.configure(text="KONTROL: AUTO NAIK", fg=RED)
         elif self.control_locked:
             self.lbl_lock.configure(text="KONTROL: TERKUNCI", fg=RED)
@@ -1218,7 +1256,10 @@ class App(tk.Tk):
     def _refresh_lock_button(self):
         """Mengatur tombol override sesuai kondisi bahaya dan auto ascent."""
         hazard = bool(self._danger_reasons())
-        if self.auto_ascent:
+        if self.estop:
+            self.btn_unlock.configure(text="E-STOP AKTIF",
+                                      state="disabled")
+        elif self.auto_ascent:
             self.btn_unlock.configure(text="AUTO NAIK AKTIF",
                                       state="disabled")
         elif hazard and self.control_locked:
@@ -1230,6 +1271,24 @@ class App(tk.Tk):
         else:
             self.btn_unlock.configure(text="TIDAK ADA KENDALA",
                                       state="disabled")
+
+    def _refresh_kill_button(self):
+        """Tombol darurat berubah menjadi tombol aktifkan ulang setelah E-STOP.
+
+        Tombol aktifkan ulang hanya bisa ditekan bila sensor sudah normal.
+        """
+        if not self.estop:
+            self.btn_kill.configure(
+                text="KILL SWITCH / EMERGENCY STOP", bg=RED, fg="white",
+                activebackground=RED_ACTIVE, state="normal",
+                disabledforeground="white")
+            return
+        hazard = bool(self._danger_reasons())
+        self.btn_kill.configure(
+            text="AKTIFKAN KONTROL KEMBALI", bg=GREEN if not hazard else SOFT,
+            fg="white" if not hazard else INK_MUTED,
+            activebackground=GREEN, state="disabled" if hazard else "normal",
+            disabledforeground=INK_MUTED)
 
     def _refresh_motor_view(self):
         """Menampilkan kecepatan tiap thruster pada kartu status."""
@@ -1246,11 +1305,11 @@ class App(tk.Tk):
             direction.configure(bg=tint, text=motor["dir"],
                                 fg=GREEN if active else INK_MUTED)
 
-        name = self.thruster_var.get()
-        if name:
-            self.lbl_speed.configure(text=f"{self.motor[name]['speed']} %")
-        else:
+        if not self.selected:
             self.lbl_speed.configure(text="-")
+        else:
+            speeds = [self.motor[name]["speed"] for name in self.selected]
+            self.lbl_speed.configure(text=f"{max(speeds)} %")
 
     # -----------------------------------------------------------------
     # 8. PERINTAH DAN SAFETY INTERLOCK
@@ -1300,18 +1359,26 @@ class App(tk.Tk):
         except OSError as err:
             self.log(f"Gagal menulis {CMD_FILE}: {err}", "red")
 
-    def _check_interlock(self, name, current, target):
+    def _check_interlock(self, targets, target):
         """Mengembalikan pesan blokir, atau None jika perintah aman."""
         if not self.link_ok:
             return "Data telemetri terputus (LINK LOST). Kontrol dikunci."
+        if self.estop:
+            return ("Emergency stop aktif. Tekan AKTIFKAN KONTROL KEMBALI "
+                    "saat kondisi sudah normal.")
         if self.auto_ascent:
             return ("Auto ascent aktif. Kontrol dikunci sampai ROV mencapai "
                     "permukaan.")
         if self.control_locked:
             return (f"Kontrol terkunci: {self.lock_reason} Tekan BUKA KUNCI "
                     f"untuk override manual.")
-        if not name:
+        if not self.selected:
             return "Pilih thruster terlebih dahulu sebelum mengirim perintah."
+        if not targets:
+            return (f"Thruster yang dipilih tidak ikut arah gerak "
+                    f"{self.motion_var.get()}. Pilih thruster yang sesuai "
+                    f"atau ganti arah gerak.")
+        current = max(self.motor[name]["speed"] for name in targets)
         if current == 0 and target == SPEED_MAX:
             return ("Kecepatan langsung dari 0 % ke 100 % diblokir untuk "
                     "mencegah lonjakan arus. Naikkan secara bertahap.")
@@ -1326,26 +1393,28 @@ class App(tk.Tk):
 
     def send_command(self):
         """Menjalankan safety interlock lalu mengirim perintah ke thruster."""
-        name = self.thruster_var.get()
+        targets = self._targets_for_motion()
         target = self.speed_var.get()
-        direction = self.direction_var.get()
-        current = self.motor[name]["speed"] if name else 0
 
-        problem = self._check_interlock(name, current, target)
+        problem = self._check_interlock(targets, target)
         if problem:
             self._block(problem)
             return
 
-        self.motor[name] = {"speed": target, "dir": direction}
+        for name, direction in targets.items():
+            self.motor[name] = {"speed": target, "dir": direction}
         status = "AKTIF" if target > 0 else "BERHENTI"
-        thruster = f"Thruster {name}"
-        self.log(f"PERINTAH OK | thruster={thruster}, status={status}, "
-                 f"kecepatan={target} %, arah={direction}, "
+        daftar = ", ".join(f"{name}->{direction}"
+                           for name, direction in targets.items())
+        self.log(f"PERINTAH OK | gerak={self.motion_var.get()}, "
+                 f"status={status}, kecepatan={target} %, thruster=[{daftar}], "
                  f"{self._snapshot()}", "green")
         if self.mode == "REAL":
-            self._write_cmd(f"MOTOR {thruster} {target} {direction}")
+            self._write_cmd(f"MOTION {self.motion_var.get()} {target} "
+                            f"{daftar}")
         self._refresh_display()
-        self.set_status(f"Perintah dikirim ke {thruster}")
+        self.set_status(f"Perintah {self.motion_var.get()} dikirim "
+                        f"({len(targets)} thruster)")
 
     def _set_command(self, text):
         """Mengisi kolom perintah tanpa mengirimkannya."""
@@ -1354,24 +1423,42 @@ class App(tk.Tk):
         self.set_status(f"Perintah disiapkan: {text}")
 
     def fill_motor_command(self):
-        """Menyusun perintah motor dari pilihan thruster, kecepatan, arah."""
-        name = self.thruster_var.get()
-        if not name:
+        """Menyusun perintah motor dari pilihan thruster dan arah gerak."""
+        if not self.selected:
             messagebox.showwarning("Belum Ada Thruster",
                                    "Pilih thruster terlebih dahulu.")
             return
-        text = (f"MOTOR {name} {self.speed_var.get()} "
-                f"{self.direction_var.get()}")
-        self._set_command(text)
+        targets = self._targets_for_motion()
+        if not targets:
+            messagebox.showwarning(
+                "Tidak Cocok",
+                f"Thruster terpilih tidak ikut arah gerak "
+                f"{self.motion_var.get()}.")
+            return
+        daftar = ",".join(f"{name}:{direction}"
+                          for name, direction in targets.items())
+        self._set_command(f"MOTOR {self.motion_var.get()} "
+                          f"{self.speed_var.get()} {daftar}")
 
     # -----------------------------------------------------------------
-    # 9. DARURAT
+    # 9. DARURAT DAN AKTIFKAN ULANG
     # -----------------------------------------------------------------
+    def emergency_action(self):
+        """Tombol besar: menghentikan paksa, atau mengaktifkan ulang."""
+        if self.estop:
+            self.rearm_controls()
+        else:
+            self.kill_switch()
+
     def kill_switch(self):
         """Menghentikan paksa semua thruster dan mencatat peringatan merah."""
         for name in THRUSTERS:
             self.motor[name] = {"speed": 0, "dir": "-"}
         self.auto_ascent = False
+        self.estop = True
+        self.control_locked = True
+        self.override_hazard = False
+        self.lock_reason = "Emergency stop aktif."
         self.speed_var.set(0)
         self.log("!!! SISTEM DIHENTIKAN PAKSA oleh KILL SWITCH | "
                  "semua thruster = 0 %, status=DIHENTIKAN, "
@@ -1379,7 +1466,31 @@ class App(tk.Tk):
         if self.mode == "REAL":
             self._write_cmd("STOP")
         self._refresh_display()
-        self.set_status("KILL SWITCH aktif - sistem dihentikan paksa")
+        self.set_status("KILL SWITCH aktif - tekan tombol hijau setelah "
+                        "kondisi normal untuk mengaktifkan kembali")
+
+    def rearm_controls(self):
+        """Mengaktifkan kembali kontrol, hanya bila sensor sudah normal."""
+        if not self.estop:
+            return
+        reasons = self._danger_reasons()
+        if reasons:
+            self._block("Kontrol belum bisa diaktifkan. " + " ".join(reasons))
+            return
+        if not self.link_ok:
+            self._block("LINK LOST. Perbaiki tautan data sebelum "
+                        "mengaktifkan kontrol.")
+            return
+        self.estop = False
+        self.control_locked = False
+        self.override_hazard = False
+        self.lock_reason = ""
+        self.speed_var.set(0)
+        self.log("KONTROL DIAKTIFKAN KEMBALI. Semua thruster = 0 %.", "green")
+        if self.mode == "REAL":
+            self._write_cmd("REARM")
+        self._refresh_display()
+        self.set_status("Kontrol aktif kembali - kondisi sensor normal")
 
     def send_raw(self):
         """Mengirim perintah teks bebas dari kolom log dan mencatatnya."""
